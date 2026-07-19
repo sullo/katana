@@ -72,6 +72,10 @@ type StandardWriter struct {
 	resultCount int64
 }
 
+// customFieldsOnce guards the one-time load of the process-global
+// CustomFieldsMap. See the note in New.
+var customFieldsOnce sync.Once
+
 // New returns a new output writer instance
 func New(options Options) (Writer, error) {
 	writer := &StandardWriter{
@@ -97,21 +101,39 @@ func New(options Options) (Writer, error) {
 	if options.StoreFieldDir != "" {
 		storeFieldDir = options.StoreFieldDir
 	}
-	// if fieldConfig empty get the default file
-	if options.FieldConfig == "" {
-		var err error
-		options.FieldConfig, err = initCustomFieldConfigFile()
-		if err != nil {
-			return nil, err
+	// NOTE (nikto-platform fork): load the process-global custom-field config
+	// ONCE.
+	//
+	// CustomFieldsMap is a package global this path WRITES on every crawl,
+	// while parser.customFieldRegexParser READS it for every response of every
+	// crawl. Concurrent crawls therefore race — and a concurrent Go map
+	// read/write is an unrecoverable "fatal error: concurrent map read and map
+	// write" that kills the whole process, not merely a -race warning.
+	//
+	// Guarding the writers alone is insufficient because the hot-path reader
+	// in the parser is unguarded. Writing once instead leaves the map
+	// read-only afterwards, which makes every reader safe by construction. The
+	// config is process-global and identical on every crawl, so nothing is
+	// lost.
+	var customFieldsErr error
+	customFieldsOnce.Do(func() {
+		if options.FieldConfig == "" {
+			cfgPath, err := initCustomFieldConfigFile()
+			if err != nil {
+				customFieldsErr = err
+				return
+			}
+			options.FieldConfig = cfgPath
 		}
-	}
-	err := parseCustomFieldName(options.FieldConfig)
-	if err != nil {
-		return nil, err
-	}
-	err = loadCustomFields(options.FieldConfig, fmt.Sprintf("%s,%s", options.Fields, options.StoreFields))
-	if err != nil {
-		return nil, err
+		if err := parseCustomFieldName(options.FieldConfig); err != nil {
+			customFieldsErr = err
+			return
+		}
+		customFieldsErr = loadCustomFields(options.FieldConfig,
+			fmt.Sprintf("%s,%s", options.Fields, options.StoreFields))
+	})
+	if customFieldsErr != nil {
+		return nil, customFieldsErr
 	}
 	// Perform validations for fields and store-fields
 	if options.Fields != "" {
@@ -166,10 +188,11 @@ func New(options Options) (Writer, error) {
 		writer.errorFile = errorFile
 	}
 	if options.OutputTemplate != "" {
-		writer.outputTemplate, err = fasttemplate.NewTemplate(options.OutputTemplate, "{{", "}}")
+		tmpl, err := fasttemplate.NewTemplate(options.OutputTemplate, "{{", "}}")
 		if err != nil {
 			return nil, errkit.Wrap(err, "output: could not create output format template")
 		}
+		writer.outputTemplate = tmpl
 	}
 	return writer, nil
 }
