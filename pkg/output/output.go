@@ -74,7 +74,14 @@ type StandardWriter struct {
 
 // customFieldsOnce guards the one-time load of the process-global
 // CustomFieldsMap. See the note in New.
-var customFieldsOnce sync.Once
+var (
+	customFieldsOnce sync.Once
+	// customFieldsErr is STICKY: it is set inside the Do and returned to every
+	// later caller. A per-call variable would let the first caller consume the
+	// Once, observe a load failure, and leave every subsequent New returning a
+	// nil error over an unloaded or partially-loaded CustomFieldsMap.
+	customFieldsErr error
+)
 
 // New returns a new output writer instance
 func New(options Options) (Writer, error) {
@@ -115,7 +122,6 @@ func New(options Options) (Writer, error) {
 	// read-only afterwards, which makes every reader safe by construction. The
 	// config is process-global and identical on every crawl, so nothing is
 	// lost.
-	var customFieldsErr error
 	customFieldsOnce.Do(func() {
 		if options.FieldConfig == "" {
 			cfgPath, err := initCustomFieldConfigFile()
