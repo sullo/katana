@@ -40,6 +40,21 @@ type Crawler struct {
 
 // New returns a new standard crawler instance
 func New(options *types.CrawlerOptions) (*Crawler, error) {
+	// FORK PATCH 8b: hard-reject HeadlessNoIncognito.
+	//
+	// This engine applies its proxy per browser context, and that context is
+	// created only in the incognito branch below. With this flag on: (1) no
+	// context exists, so ProxyServer is never applied and the crawl silently
+	// escapes the MITM seam that carries logging, rate limiting and SSRF
+	// policy; and (2) c.browser stays the ROOT handle, so Crawler.Close() ->
+	// rod Browser.Close() sees an empty BrowserContextID and issues
+	// Browser.close, terminating a shared browser out from under every other
+	// concurrent crawl. Fail loudly at construction instead.
+	if options.Options.HeadlessNoIncognito {
+		return nil, errkit.New("hybrid: HeadlessNoIncognito is not supported: " +
+			"the per-context proxy and a safe Close both require an incognito browser context")
+	}
+
 	var dataStore string
 	var err error
 	if options.Options.ChromeDataDir != "" {
@@ -110,11 +125,28 @@ func New(options *types.CrawlerOptions) (*Crawler, error) {
 
 	// create a new browser instance (default to incognito mode)
 	if !options.Options.HeadlessNoIncognito {
-		// Create the browser context directly rather than via browser.Incognito():
-		// rod's helper takes no proxy argument, and Options.Proxy otherwise never
-		// reaches a browser attached through ChromeWSUrl, because the chrome
-		// launcher -- its only proxy path -- does not run in that case.
-		res, err := proto.TargetCreateBrowserContext{ProxyServer: options.Options.Proxy}.Call(browser)
+		// NOTE (nikto-platform fork): this is browser.Incognito() plus the
+		// per-context proxy.
+		//
+		// katana applies Options.Proxy to the browser ONLY via chrome-launcher
+		// args, and the launcher never runs when ChromeWSUrl attaches to an
+		// already-running browser — so the proxy was silently dropped for
+		// exactly the remote-browser setup a containerised deployment uses.
+		// Target.createBrowserContext takes a per-context proxy, which also
+		// lets concurrent crawls on one shared browser each use their own.
+		res, err := proto.TargetCreateBrowserContext{
+			ProxyServer: options.Options.Proxy,
+			// "<-loopback>" SUBTRACTS Chrome's IMPLICIT proxy bypass.
+			//
+			// Chrome bypasses the proxy for localhost / 127.0.0.0/8 / [::1] /
+			// link-local by default, EVEN when a proxy is configured. Without
+			// this, a crawl of any target that resolves to loopback egresses
+			// outside the MITM seam entirely — no activity log, no SSRF policy,
+			// no cert capture. That is precisely the failure this whole gate
+			// exists to prevent, merely narrowed to loopback, and it would be
+			// invisible: the crawl still succeeds, it is just unobserved.
+			ProxyBypassList: "<-loopback>",
+		}.Call(browser)
 		if err != nil {
 			return nil, errkit.Wrap(err, "hybrid: failed to create incognito browser")
 		}
