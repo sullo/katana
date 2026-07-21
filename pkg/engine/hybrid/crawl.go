@@ -432,30 +432,33 @@ func (c *Crawler) navigateRequest(s *common.CrawlSession, request *navigation.Re
 }
 
 func (c *Crawler) addHeadersToPage(page *rod.Page) {
-	if len(c.Headers) == 0 {
-		return
-	}
+	// FORK PATCH 11: seeding (below) must run even when there are no custom
+	// headers, so the empty-Headers early return this function used to open
+	// with is now scoped to the header loop only. Do NOT reinstate a top-level
+	// `if len(c.Headers) == 0 { return }` -- it silently disables cookie and
+	// JS-storage seeding on every crawl that sets no custom header.
+	if len(c.Headers) > 0 {
+		var arr []string
 
-	var arr []string
-
-	for k, v := range c.Headers {
-		switch {
-		case stringsutil.EqualFoldAny(k, "User-Agent"):
-			userAgentParams := &proto.NetworkSetUserAgentOverride{
-				UserAgent: v,
+		for k, v := range c.Headers {
+			switch {
+			case stringsutil.EqualFoldAny(k, "User-Agent"):
+				userAgentParams := &proto.NetworkSetUserAgentOverride{
+					UserAgent: v,
+				}
+				if err := page.SetUserAgent(userAgentParams); err != nil {
+					gologger.Error().Msgf("headless: could not set user agent: %v", err)
+				}
+			default:
+				arr = append(arr, k, v)
 			}
-			if err := page.SetUserAgent(userAgentParams); err != nil {
-				gologger.Error().Msgf("headless: could not set user agent: %v", err)
-			}
-		default:
-			arr = append(arr, k, v)
 		}
-	}
 
-	if len(arr) > 0 {
-		_, err := page.SetExtraHeaders(arr)
-		if err != nil {
-			gologger.Error().Msgf("headless: could not set extra headers: %v", err)
+		if len(arr) > 0 {
+			_, err := page.SetExtraHeaders(arr)
+			if err != nil {
+				gologger.Error().Msgf("headless: could not set extra headers: %v", err)
+			}
 		}
 	}
 
