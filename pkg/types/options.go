@@ -211,6 +211,17 @@ type Options struct {
 	// self-gate on location.origin against an in-scope allowlist -- that gate
 	// is built into the script string itself, not enforced by katana/CDP.
 	SeedStorageScript string
+	// FORK PATCH 12: VersionProbeScript is JS evaluated AFTER each page
+	// renders (hybrid engine navigateRequest, post-body-capture), NOT before
+	// like SeedStorageScript above. It must return a JSON object of
+	// component->version (e.g. {"jquery":"3.6.0"}) read off the LIVE,
+	// rendered page (globals, DOM attributes, etc.) so SPA-loaded library
+	// versions that static Wappalyzer fingerprinting on the raw response
+	// body would miss are captured too. Fixed and caller-authored (built on
+	// the nikto-platform side); NEVER target-derived. A probe failure
+	// (throw, timeout, bad JSON) never fails the page crawl -- it just
+	// leaves Response.Versions nil for that page.
+	VersionProbeScript string
 	// DisableRedirects disables the following of redirects
 	DisableRedirects bool
 	// PageContentSimilar enables optional Layer-2 content similarity filtering

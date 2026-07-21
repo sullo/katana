@@ -42,6 +42,13 @@ type Response struct {
 	XhrRequests        []Request         `json:"xhr_requests,omitempty"`
 	StoredResponsePath string            `json:"stored_response_path,omitempty"`
 	KnowledgeBase      map[string]any    `json:"knowledgebase,omitempty"`
+	// FORK PATCH 12: Versions is a component->version map read from the live
+	// rendered page via types.Options.VersionProbeScript, evaluated AFTER
+	// the page has fully rendered. Populated only on the navigation result
+	// for the rendered HTML page itself (never on sub-resource results such
+	// as .js/.css/xhr fetches). nil on probe error/timeout/bad JSON -- a
+	// probe failure never fails the crawl.
+	Versions map[string]string `json:"versions,omitempty"`
 }
 
 func (n Response) AbsoluteURL(path string) string {
