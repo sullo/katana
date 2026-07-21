@@ -3,7 +3,9 @@ package hybrid
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httputil"
@@ -409,6 +411,13 @@ func (c *Crawler) navigateRequest(s *common.CrawlSession, request *navigation.Re
 		return nil, errkit.Wrap(err, "hybrid: could not parse html")
 	}
 
+	// FORK PATCH 12: evaluate the caller-supplied version-probe script now
+	// that the page has fully rendered (HTML captured above), and attach
+	// the result ONLY to this rendered-page response -- never to the
+	// sub-resource (.js/.css/xhr) responses built inside the hijack
+	// callback above.
+	response.Versions = c.evaluateVersionProbe(sessionPage)
+
 	response.XhrRequests = xhrRequests
 
 	// enqueue JS-triggered navigation URLs that were detected
@@ -483,6 +492,90 @@ func (c *Crawler) addHeadersToPage(page *rod.Page) {
 			gologger.Error().Msgf("headless: could not seed storage script: %v", err)
 		}
 	}
+}
+
+// FORK PATCH 12: post-render version-probe limits. maxProbeRawBytes bounds
+// the raw string handed back over CDP BEFORE it is ever parsed -- the page
+// fully controls its own output (a hostile/compromised page can return a
+// gigabyte string regardless of any in-page .slice()), so this is the real
+// control, enforced at the point the CDP payload is first seen in Go.
+// maxProbeEntries/maxProbeValueBytes are a secondary belt-and-suspenders cap
+// on the parsed map (the api side re-applies its own caps independently).
+const (
+	versionProbeTimeout = 3 * time.Second
+	maxProbeRawBytes    = 16 * 1024
+	maxProbeEntries     = 32
+	maxProbeValueBytes  = 64
+)
+
+// evaluateVersionProbe runs c.Options.Options.VersionProbeScript against the
+// live, already-rendered page and returns a component->version map, or nil
+// on ANY failure (no script configured, eval throw, timeout, oversized
+// result, invalid JSON). A probe failure must never fail the page crawl --
+// the caller always continues with the rest of navigateRequest regardless
+// of what this returns.
+func (c *Crawler) evaluateVersionProbe(page *rod.Page) map[string]string {
+	script := c.Options.Options.VersionProbeScript
+	if script == "" {
+		return nil
+	}
+
+	// Bounded context: this is the ONLY thing that catches a hanging getter
+	// inside the probe (there is no per-statement timeout inside the JS
+	// itself). Correctly discarding the whole page's versions when the
+	// probe hangs is intended, never-fatal behavior.
+	probePage := page.Timeout(versionProbeTimeout)
+
+	// Wrap the caller's script so its result is always returned as a JSON
+	// string via JSON.stringify, and so a thrown exception inside the
+	// probe never propagates as a Go-visible eval error.
+	wrapped := fmt.Sprintf(`() => {
+		try {
+			return JSON.stringify((function() { %s })());
+		} catch (e) {
+			return "";
+		}
+	}`, script)
+
+	obj, err := probePage.Eval(wrapped)
+	if err != nil {
+		gologger.Debug().Msgf("hybrid: version probe eval failed (never fatal): %v", err)
+		return nil
+	}
+
+	raw := obj.Value.Str()
+	if raw == "" {
+		return nil
+	}
+	// Bound the raw bytes BEFORE parsing -- this is where the CDP payload
+	// is first seen in Go.
+	if len(raw) > maxProbeRawBytes {
+		gologger.Debug().Msgf("hybrid: version probe result exceeded %d bytes, discarding", maxProbeRawBytes)
+		return nil
+	}
+
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		gologger.Debug().Msgf("hybrid: version probe result was not a JSON object of strings: %v", err)
+		return nil
+	}
+	if len(parsed) == 0 {
+		return nil
+	}
+
+	capped := make(map[string]string, min(len(parsed), maxProbeEntries))
+	count := 0
+	for k, v := range parsed {
+		if count >= maxProbeEntries {
+			break
+		}
+		if len(v) > maxProbeValueBytes {
+			v = v[:maxProbeValueBytes]
+		}
+		capped[k] = v
+		count++
+	}
+	return capped
 }
 
 // traverseDOMNode performs traversal of node completely building a pseudo-HTML
