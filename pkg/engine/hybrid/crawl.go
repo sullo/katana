@@ -458,6 +458,28 @@ func (c *Crawler) addHeadersToPage(page *rod.Page) {
 			gologger.Error().Msgf("headless: could not set extra headers: %v", err)
 		}
 	}
+
+	// FORK PATCH 11: seed per-scan session material before navigation.
+	//
+	// Cookies are domain-scoped by SetCookies, so the browser enforces scope.
+	// This is the AUTHORITATIVE cookie injection for the hybrid path; the
+	// proxy (patch 8) only merges distinct extras and never overwrites these.
+	if len(c.Options.Options.SeedCookies) > 0 {
+		if err := page.SetCookies(c.Options.Options.SeedCookies); err != nil {
+			gologger.Error().Msgf("headless: could not set seed cookies: %v", err)
+		}
+	}
+	// JS-storage: EvalOnNewDocument (addScriptToEvaluateOnNewDocument) runs in
+	// EVERY new document, INCLUDING third-party iframes. An unguarded
+	// localStorage.setItem(token) would leak the session to third-party
+	// origins. The injected script MUST self-gate on location.origin against
+	// the in-scope allowlist -- CDP cannot target the injection by origin, so
+	// the gate lives in the script itself (built on the nikto-platform side).
+	if len(c.Options.Options.SeedStorageScript) > 0 {
+		if _, err := page.EvalOnNewDocument(c.Options.Options.SeedStorageScript); err != nil {
+			gologger.Error().Msgf("headless: could not seed storage script: %v", err)
+		}
+	}
 }
 
 // traverseDOMNode performs traversal of node completely building a pseudo-HTML

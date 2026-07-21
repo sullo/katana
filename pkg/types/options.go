@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/projectdiscovery/goflags"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/gologger/levels"
@@ -196,6 +197,20 @@ type Options struct {
 	Debug bool
 	// TlsImpersonate enables experimental tls ClientHello randomization for standard crawler
 	TlsImpersonate bool
+
+	// FORK PATCH 11: per-scan session material seeded into each headless page
+	// (hybrid engine addHeadersToPage) before navigation. Built entirely on
+	// the nikto-platform side (internal/platform/crawler) from credentials +
+	// scan scope -- katana only carries and applies these values.
+	//
+	// SeedCookies is set via rod page.SetCookies (domain-scoped, browser
+	// enforces scope) and is authoritative for the hybrid crawl path.
+	SeedCookies []*proto.NetworkCookieParam
+	// SeedStorageScript is injected via rod page.EvalOnNewDocument, which runs
+	// in EVERY new document including third-party iframes. The script MUST
+	// self-gate on location.origin against an in-scope allowlist -- that gate
+	// is built into the script string itself, not enforced by katana/CDP.
+	SeedStorageScript string
 	// DisableRedirects disables the following of redirects
 	DisableRedirects bool
 	// PageContentSimilar enables optional Layer-2 content similarity filtering
