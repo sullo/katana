@@ -222,6 +222,17 @@ type Options struct {
 	// (throw, timeout, bad JSON) never fails the page crawl -- it just
 	// leaves Response.Versions nil for that page.
 	VersionProbeScript string
+	// FORK PATCH 13: ScreenshotViewport, when true, makes the hybrid engine
+	// capture ONE above-the-fold screenshot -- the visible viewport only,
+	// never a stitched full-page capture -- of the FIRST page navigated in a
+	// crawl, at the same post-render seam as VersionProbeScript above. A crawl
+	// has a single seed, so that first page is the home page; capturing every
+	// page would push hundreds of image blobs into storage. The result is
+	// surfaced as navigation.Response.Screenshot/ScreenshotFormat. Default
+	// false means zero behavior change and zero extra CDP calls. A capture
+	// failure (CDP error, timeout) never fails the page crawl -- it just
+	// leaves Response.Screenshot nil.
+	ScreenshotViewport bool
 	// DisableRedirects disables the following of redirects
 	DisableRedirects bool
 	// PageContentSimilar enables optional Layer-2 content similarity filtering

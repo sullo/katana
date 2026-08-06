@@ -49,6 +49,18 @@ type Response struct {
 	// as .js/.css/xhr fetches). nil on probe error/timeout/bad JSON -- a
 	// probe failure never fails the crawl.
 	Versions map[string]string `json:"versions,omitempty"`
+	// FORK PATCH 13: Screenshot is one above-the-fold (visible viewport only,
+	// never full-page) capture of the live rendered page, taken via
+	// types.Options.ScreenshotViewport for the FIRST navigated page of a crawl
+	// only -- a crawl has one seed, so that page is the home page, and
+	// capturing every page would push hundreds of blobs into storage.
+	// Populated only on the navigation result for the rendered HTML page
+	// itself (never on sub-resource results such as .js/.css/xhr fetches).
+	// nil on capture error/timeout, or on every page after the first -- a
+	// screenshot failure never fails the crawl. ScreenshotFormat is the image
+	// encoding ("jpeg"), set only when Screenshot is non-nil.
+	Screenshot       []byte `json:"screenshot,omitempty"`
+	ScreenshotFormat string `json:"screenshot_format,omitempty"`
 }
 
 func (n Response) AbsoluteURL(path string) string {
