@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -36,6 +37,12 @@ type Crawler struct {
 	// https://github.com/projectdiscovery/httpx/issues/1425
 	// previousPIDs map[int32]struct{} // track already running PIDs
 	tempDir string
+	// FORK PATCH 13: one-shot guard for the above-the-fold viewport
+	// screenshot. A crawl has a single seed, so the first navigated page is
+	// the home page and the only one worth capturing; screenshotting every
+	// page would push hundreds of blobs into Postgres. Atomic because hybrid
+	// workers render pages concurrently -- exactly one CompareAndSwap wins.
+	screenshotTaken atomic.Bool
 }
 
 // New returns a new standard crawler instance

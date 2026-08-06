@@ -418,6 +418,15 @@ func (c *Crawler) navigateRequest(s *common.CrawlSession, request *navigation.Re
 	// callback above.
 	response.Versions = c.evaluateVersionProbe(sessionPage)
 
+	// FORK PATCH 13: capture one above-the-fold viewport screenshot, at the
+	// same seam and for the same reason as patch 12 above -- the page has
+	// fully rendered here, and this is the rendered-page response, never a
+	// sub-resource (.js/.css/xhr) response built inside the hijack callback.
+	if screenshot := c.captureViewportScreenshot(sessionPage); screenshot != nil {
+		response.Screenshot = screenshot
+		response.ScreenshotFormat = "jpeg"
+	}
+
 	response.XhrRequests = xhrRequests
 
 	// enqueue JS-triggered navigation URLs that were detected
@@ -576,6 +585,56 @@ func (c *Crawler) evaluateVersionProbe(page *rod.Page) map[string]string {
 		count++
 	}
 	return capped
+}
+
+// FORK PATCH 13: viewport-screenshot limits.
+const (
+	screenshotTimeout = 5 * time.Second
+	screenshotQuality = 70
+)
+
+// captureViewportScreenshot returns one above-the-fold JPEG of the live,
+// already-rendered page, or nil on ANY failure (screenshots disabled, another
+// page already claimed the single per-crawl slot, CDP error, timeout).
+//
+// ONCE PER CRAWL SESSION: a crawl has exactly one seed, so the first page to
+// reach this point is the home page -- that is the only page worth a picture.
+// Capturing every page would push hundreds of image blobs into Postgres. The
+// atomic CompareAndSwap is what makes that safe when several hybrid workers
+// render pages concurrently: exactly one wins the swap and takes the shot.
+//
+// A screenshot failure must never fail the page crawl -- the caller always
+// continues with the rest of navigateRequest regardless of what this returns.
+func (c *Crawler) captureViewportScreenshot(page *rod.Page) []byte {
+	if !c.Options.Options.ScreenshotViewport {
+		return nil
+	}
+	// Guard is claimed BEFORE the CDP call: a failed/timed-out attempt still
+	// consumes the slot, so a hostile first page cannot make every subsequent
+	// page pay for a screenshot attempt.
+	if !c.screenshotTaken.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	// Bounded context: the only thing that catches a hanging capture (a page
+	// still painting, a wedged renderer). Discarding the screenshot on
+	// timeout is intended, never-fatal behavior.
+	quality := screenshotQuality
+	// fullPage=false is REQUIRED: we want only the visible viewport
+	// ("above the fold"), never a stitched full-page capture (which would
+	// resize the viewport and repaint the page mid-crawl).
+	data, err := page.Timeout(screenshotTimeout).Screenshot(false, &proto.PageCaptureScreenshot{
+		Format:  proto.PageCaptureScreenshotFormatJpeg,
+		Quality: &quality,
+	})
+	if err != nil {
+		gologger.Debug().Msgf("hybrid: viewport screenshot failed (never fatal): %v", err)
+		return nil
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	return data
 }
 
 // traverseDOMNode performs traversal of node completely building a pseudo-HTML
