@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/projectdiscovery/goflags"
@@ -279,8 +280,24 @@ func (options *Options) ShouldResume() bool {
 	return options.Resume != "" && fileutil.FileExists(options.Resume)
 }
 
+// configureOutputOnce guards the process-global logger mutation below.
+//
+// NOTE (nikto-platform fork): gologger.DefaultLogger.SetMaxLevel writes an
+// unsynchronized global that gologger READS on every log call. Calling
+// ConfigureOutput once per crawl therefore races every concurrently running
+// crawl (reproducible under -race: 4 concurrent crawls, 5 race reports).
+// Applying it once per process removes the write-after-first-crawl entirely,
+// so concurrent crawls need no external lock. Consequence: the FIRST caller's
+// verbosity wins process-wide, which is the sane behaviour for a library
+// mutating a global logger it does not own.
+var configureOutputOnce sync.Once
+
 // ConfigureOutput configures the output logging levels to be displayed on the screen
 func (options *Options) ConfigureOutput() {
+	configureOutputOnce.Do(func() { options.configureOutput() })
+}
+
+func (options *Options) configureOutput() {
 	if options.Silent {
 		gologger.DefaultLogger.SetMaxLevel(levels.LevelSilent)
 	} else if options.Verbose {
