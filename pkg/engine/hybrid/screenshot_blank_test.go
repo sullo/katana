@@ -6,6 +6,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	"math/rand"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -100,5 +101,65 @@ func TestTimeLeftClampsToDeadline(t *testing.T) {
 	}
 	if got := timeLeft(time.Now().Add(-time.Second), time.Second); got > 0 {
 		t.Fatalf("want non-positive past the deadline, got %s", got)
+	}
+}
+
+// FORK PATCH 13 regression: the seed gate. The screenshot slot was taken by
+// whichever page reached the capture seam first, and that was routinely a
+// script[src] URL navigated as its own page -- Chrome renders JavaScript
+// source as plain text, which has enough luma variance to pass the blank
+// check above, so the wrong picture shipped looking entirely correct.
+//
+// isHTMLResponse is the second half of that gate (request.Depth == 0 is the
+// first). It must never answer yes on a missing or non-HTML Content-Type:
+// "could not determine" is not permission to proceed as if the answer were
+// yes, and the media type is the only trustworthy signal here -- the body is
+// hostile-controlled and is deliberately never sniffed.
+func TestIsHTMLResponse(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		want        bool
+	}{
+		{"plain html", "text/html", true},
+		{"html with charset", "text/html; charset=utf-8", true},
+		{"html uppercase", "TEXT/HTML", true},
+		{"html with spaces", "  text/html  ", true},
+		{"xhtml", "application/xhtml+xml", true},
+
+		// The case this gate exists for.
+		{"javascript", "application/javascript", false},
+		{"javascript legacy", "text/javascript", false},
+		{"json", "application/json", false},
+		{"css", "text/css", false},
+		{"plain text", "text/plain", false},
+		{"image", "image/png", false},
+		{"download", "application/octet-stream", false},
+
+		// Absent or unparseable: unknown, which is not HTML.
+		{"empty", "", false},
+		{"garbage", "not-a-media-type", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{Header: http.Header{}}
+			if tt.contentType != "" {
+				resp.Header.Set("Content-Type", tt.contentType)
+			}
+			if got := isHTMLResponse(resp); got != tt.want {
+				t.Errorf("isHTMLResponse(%q) = %v, want %v", tt.contentType, got, tt.want)
+			}
+		})
+	}
+
+	// A nil response is "no answer", never HTML. captureViewportScreenshot is
+	// called with response.Resp, which navigateRequest has already checked,
+	// but the gate must not depend on that check staying where it is.
+	if isHTMLResponse(nil) {
+		t.Error("isHTMLResponse(nil) = true, want false")
+	}
+	if got := responseContentType(nil); got != "" {
+		t.Errorf("responseContentType(nil) = %q, want empty", got)
 	}
 }
