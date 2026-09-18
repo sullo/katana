@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image/jpeg"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -427,7 +428,15 @@ func (c *Crawler) navigateRequest(s *common.CrawlSession, request *navigation.Re
 	// same seam and for the same reason as patch 12 above -- the page has
 	// fully rendered here, and this is the rendered-page response, never a
 	// sub-resource (.js/.css/xhr) response built inside the hijack callback.
-	if screenshot := c.captureViewportScreenshot(timeoutCtx, sessionPage, request.URL); screenshot != nil {
+	//
+	// The seam alone is NOT enough to identify the home page. The parser
+	// turns every script[src] into its own navigation request (and
+	// -jsluice/-scrape-js adds more), those are enqueued from inside the
+	// hijack callback WHILE THE SEED IS STILL LOADING, and a .js URL opened
+	// as its own page renders as plain text and reaches this line long
+	// before the seed does. The gate inside is what keeps the slot for the
+	// seed's own HTML document.
+	if screenshot := c.captureViewportScreenshot(timeoutCtx, sessionPage, request, response.Resp); screenshot != nil {
 		response.Screenshot = screenshot
 		response.ScreenshotFormat = "jpeg"
 	}
@@ -637,24 +646,56 @@ const (
 // page already claimed the single per-crawl slot, CDP error, timeout, no
 // budget left).
 //
-// ONCE PER CRAWL SESSION: a crawl has exactly one seed, so the first page to
-// reach this point is the home page -- that is the only page worth a picture.
-// Capturing every page would push hundreds of image blobs into Postgres. The
-// atomic CompareAndSwap is what makes that safe when several hybrid workers
-// render pages concurrently: exactly one wins the swap and takes the shot.
+// ONCE PER CRAWL SESSION, AND ONLY FOR THE SEED'S OWN HTML DOCUMENT.
+// Capturing every page would push hundreds of image blobs into Postgres, so a
+// crawl gets exactly one picture and it must be of the home page.
+//
+// Two gates decide that, both BEFORE the CompareAndSwap, so a rejected page
+// never consumes the single slot:
+//
+//   - request.Depth == 0 -- the seed, and only the seed. "First page to reach
+//     this line" is NOT the seed: script[src] URLs are enqueued from inside
+//     the seed's own hijack callback while the seed is still rendering, and
+//     several hybrid workers navigate them concurrently. A .js page has no
+//     sub-resources and no render work, so it arrives here first and Chrome
+//     photographs JavaScript source as plain text.
+//   - the response's Content-Type is HTML. A seed that redirects to a file
+//     download, or a host whose root serves JSON, is not worth a picture.
+//
+// NO FALLBACK IS INTENDED. If the seed cannot be photographed the target gets
+// no screenshot at all: a picture of the wrong page is worse than none,
+// because nothing downstream distinguishes it from a correct capture.
+//
+// The atomic CompareAndSwap still guards the slot for the case a seed is
+// retried or a session somehow carries more than one depth-0 request.
 //
 // A screenshot failure must never fail the page crawl -- the caller always
 // continues with the rest of navigateRequest regardless of what this returns.
 // It is, however, never silent: every give-up path logs a warning naming the
 // URL, because a page photographed before it finished rendering is otherwise
 // indistinguishable from a correct capture.
-func (c *Crawler) captureViewportScreenshot(ctx context.Context, page *rod.Page, targetURL string) []byte {
+func (c *Crawler) captureViewportScreenshot(ctx context.Context, page *rod.Page, request *navigation.Request, resp *http.Response) []byte {
 	if !c.Options.Options.ScreenshotViewport {
 		return nil
 	}
-	// Guard is claimed BEFORE any wait or CDP call: a failed/timed-out attempt
-	// still consumes the slot, so a hostile first page cannot make every
-	// subsequent page pay for a screenshot attempt.
+	if request == nil {
+		return nil
+	}
+	targetURL := request.URL
+	// Seed only. Children are enqueued with Depth = parent + 1 (see the top of
+	// navigateRequest), so depth 0 is the one URL the operator asked for.
+	if request.Depth != 0 {
+		return nil
+	}
+	// HTML only. Silent on a non-HTML seed would be indistinguishable from a
+	// capture that simply failed, so it is logged.
+	if !isHTMLResponse(resp) {
+		gologger.Warning().Msgf("hybrid: no viewport screenshot of %s: seed is not HTML (content-type %q)", targetURL, responseContentType(resp))
+		return nil
+	}
+	// Guard is claimed AFTER the cheap gates but BEFORE any wait or CDP call:
+	// a failed/timed-out attempt still consumes the slot, so a hostile seed
+	// cannot make every subsequent page pay for a screenshot attempt.
 	if !c.screenshotTaken.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -716,6 +757,33 @@ func (c *Crawler) captureViewportScreenshot(ctx context.Context, page *rod.Page,
 	// rendering rather than left to trust the picture.
 	gologger.Warning().Msgf("hybrid: viewport screenshot of %s still looks blank after %d attempt(s); storing it anyway -- the page may not have finished rendering", targetURL, screenshotRetries+1)
 	return best
+}
+
+// responseContentType returns the response's raw Content-Type header, or ""
+// when there is no response or no header.
+func responseContentType(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	return resp.Header.Get("Content-Type")
+}
+
+// isHTMLResponse reports whether the response is an HTML document, using only
+// the declared media type -- never a sniff of the body, which is
+// hostile-controlled. A missing Content-Type is NOT treated as HTML: "could
+// not determine" is not permission to proceed as if the answer were yes.
+func isHTMLResponse(resp *http.Response) bool {
+	ct := responseContentType(resp)
+	if ct == "" {
+		return false
+	}
+	if mediaType, _, err := mime.ParseMediaType(ct); err == nil {
+		ct = mediaType
+	} else if idx := strings.IndexByte(ct, ';'); idx >= 0 {
+		ct = ct[:idx]
+	}
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	return ct == "text/html" || ct == "application/xhtml+xml"
 }
 
 // timeLeft returns want, clamped to the time remaining before deadline.
