@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/jpeg"
 	"io"
 	"net/http"
 	"net/http/httputil"
@@ -422,7 +423,7 @@ func (c *Crawler) navigateRequest(s *common.CrawlSession, request *navigation.Re
 	// same seam and for the same reason as patch 12 above -- the page has
 	// fully rendered here, and this is the rendered-page response, never a
 	// sub-resource (.js/.css/xhr) response built inside the hijack callback.
-	if screenshot := c.captureViewportScreenshot(sessionPage); screenshot != nil {
+	if screenshot := c.captureViewportScreenshot(timeoutCtx, sessionPage, request.URL); screenshot != nil {
 		response.Screenshot = screenshot
 		response.ScreenshotFormat = "jpeg"
 	}
@@ -588,14 +589,49 @@ func (c *Crawler) evaluateVersionProbe(page *rod.Page) map[string]string {
 }
 
 // FORK PATCH 13: viewport-screenshot limits.
+//
+// Every duration here is spent INSIDE the seed page's per-navigation timeout
+// (navigateRequest's timeoutCtx). An overrun does not merely lose the
+// screenshot: it loses the seed's rendered response, and with it every
+// JS-discovered link -- the same failure the page-load-strategy default
+// exists to avoid. They are deliberately short for that reason. Lengthen only
+// on evidence that the longer wait produces better captures.
 const (
-	screenshotTimeout = 5 * time.Second
+	screenshotTimeout = 3 * time.Second
 	screenshotQuality = 70
+	// screenshotLoadWait bounds the pre-shot wait for window.onload. Pages
+	// that already fired it pay nothing.
+	screenshotLoadWait = 2 * time.Second
+	// A capture that comes back blank is re-taken: the common case is a
+	// fetch-then-render SPA whose DOM is complete but whose viewport is still
+	// empty at DOMContentLoaded + DOMWaitTime.
+	screenshotRetries   = 2
+	screenshotRetryWait = 1 * time.Second
+	// screenshotBudget caps the whole block (wait + shots + retries), further
+	// clamped to what is left of the navigation deadline.
+	screenshotBudget = 6 * time.Second
+	// screenshotMinBudget is the least remaining navigation budget worth
+	// starting a capture with: below it we would spend the seed page's last
+	// moments on a picture instead of on returning its rendered DOM.
+	screenshotMinBudget = 1500 * time.Millisecond
+	// screenshotMinBytes: a JPEG of a uniform viewport compresses to almost
+	// nothing, so size is a cheap pre-filter before the decode-and-sample.
+	screenshotMinBytes = 3 * 1024
+	// screenshotBlankVariance is the sampled-luma variance below which a
+	// capture counts as blank (0 = every sampled pixel identical). A spinner
+	// on white sits well under it. A bot-check or block interstitial does
+	// NOT -- those carry text, and photographing them is intended: what the
+	// scanner was served is exactly what the operator needs to see.
+	screenshotBlankVariance = 25.0
+	// screenshotSampleStride subsamples the decoded image; a full per-pixel
+	// pass over a viewport JPEG is pointless for a variance estimate.
+	screenshotSampleStride = 16
 )
 
 // captureViewportScreenshot returns one above-the-fold JPEG of the live,
 // already-rendered page, or nil on ANY failure (screenshots disabled, another
-// page already claimed the single per-crawl slot, CDP error, timeout).
+// page already claimed the single per-crawl slot, CDP error, timeout, no
+// budget left).
 //
 // ONCE PER CRAWL SESSION: a crawl has exactly one seed, so the first page to
 // reach this point is the home page -- that is the only page worth a picture.
@@ -605,36 +641,151 @@ const (
 //
 // A screenshot failure must never fail the page crawl -- the caller always
 // continues with the rest of navigateRequest regardless of what this returns.
-func (c *Crawler) captureViewportScreenshot(page *rod.Page) []byte {
+// It is, however, never silent: every give-up path logs a warning naming the
+// URL, because a page photographed before it finished rendering is otherwise
+// indistinguishable from a correct capture.
+func (c *Crawler) captureViewportScreenshot(ctx context.Context, page *rod.Page, targetURL string) []byte {
 	if !c.Options.Options.ScreenshotViewport {
 		return nil
 	}
-	// Guard is claimed BEFORE the CDP call: a failed/timed-out attempt still
-	// consumes the slot, so a hostile first page cannot make every subsequent
-	// page pay for a screenshot attempt.
+	// Guard is claimed BEFORE any wait or CDP call: a failed/timed-out attempt
+	// still consumes the slot, so a hostile first page cannot make every
+	// subsequent page pay for a screenshot attempt.
 	if !c.screenshotTaken.CompareAndSwap(false, true) {
 		return nil
 	}
 
-	// Bounded context: the only thing that catches a hanging capture (a page
-	// still painting, a wedged renderer). Discarding the screenshot on
-	// timeout is intended, never-fatal behavior.
+	budget := screenshotBudget
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < budget {
+			budget = remaining
+		}
+	}
+	if budget < screenshotMinBudget {
+		gologger.Warning().Msgf("hybrid: skipped viewport screenshot of %s: only %s of the navigation budget left", targetURL, budget)
+		return nil
+	}
+	deadline := time.Now().Add(budget)
+
+	// window.onload, bounded. Returns immediately when already fired, which is
+	// the usual case by the time navigateRequest reaches here. Deliberately
+	// NOT WaitRequestIdle: katana's hijack holds every request paused until
+	// its handler continues it, so request-idle is not reachable on an
+	// ordinary page and would burn its full timeout on every crawl.
+	if wait := timeLeft(deadline, screenshotLoadWait); wait > 0 {
+		if err := page.Timeout(wait).WaitLoad(); err != nil {
+			gologger.Debug().Msgf("hybrid: pre-screenshot load wait for %s ended early (never fatal): %v", targetURL, err)
+		}
+	}
+
+	var best []byte
+	for attempt := 0; attempt <= screenshotRetries; attempt++ {
+		shot := c.screenshotOnce(page, deadline)
+		if len(shot) > len(best) {
+			best = shot
+		}
+		if len(shot) > 0 && !screenshotIsBlank(shot) {
+			return shot
+		}
+		if attempt == screenshotRetries {
+			break
+		}
+		pause := timeLeft(deadline, screenshotRetryWait)
+		if pause <= 0 {
+			gologger.Warning().Msgf("hybrid: viewport screenshot of %s still blank and out of budget after %d attempt(s)", targetURL, attempt+1)
+			break
+		}
+		select {
+		case <-ctx.Done():
+			gologger.Warning().Msgf("hybrid: viewport screenshot of %s abandoned: navigation context ended after %d attempt(s)", targetURL, attempt+1)
+			return best
+		case <-time.After(pause):
+		}
+	}
+
+	if len(best) == 0 {
+		gologger.Warning().Msgf("hybrid: viewport screenshot of %s produced no image; none will be stored", targetURL)
+		return nil
+	}
+	// A genuinely blank page is a real answer, so the last capture is still
+	// returned -- but the operator is told the page may not have finished
+	// rendering rather than left to trust the picture.
+	gologger.Warning().Msgf("hybrid: viewport screenshot of %s still looks blank after %d attempt(s); storing it anyway -- the page may not have finished rendering", targetURL, screenshotRetries+1)
+	return best
+}
+
+// timeLeft returns want, clamped to the time remaining before deadline.
+func timeLeft(deadline time.Time, want time.Duration) time.Duration {
+	if remaining := time.Until(deadline); remaining < want {
+		return remaining
+	}
+	return want
+}
+
+// screenshotOnce takes a single capture, bounded by the smaller of
+// screenshotTimeout and what is left of the caller's deadline. Returns nil on
+// any error.
+func (c *Crawler) screenshotOnce(page *rod.Page, deadline time.Time) []byte {
+	timeout := timeLeft(deadline, screenshotTimeout)
+	if timeout <= 0 {
+		return nil
+	}
 	quality := screenshotQuality
 	// fullPage=false is REQUIRED: we want only the visible viewport
 	// ("above the fold"), never a stitched full-page capture (which would
 	// resize the viewport and repaint the page mid-crawl).
-	data, err := page.Timeout(screenshotTimeout).Screenshot(false, &proto.PageCaptureScreenshot{
+	data, err := page.Timeout(timeout).Screenshot(false, &proto.PageCaptureScreenshot{
 		Format:  proto.PageCaptureScreenshotFormatJpeg,
 		Quality: &quality,
 	})
 	if err != nil {
-		gologger.Debug().Msgf("hybrid: viewport screenshot failed (never fatal): %v", err)
+		gologger.Debug().Msgf("hybrid: viewport screenshot attempt failed (never fatal): %v", err)
 		return nil
 	}
 	if len(data) == 0 {
 		return nil
 	}
 	return data
+}
+
+// screenshotIsBlank reports whether a capture is visually empty -- a uniform
+// field of one colour, which is what a page still waiting on its first render
+// photographs as.
+//
+// It is a HEURISTIC and only ever costs a retry, so it is tuned conservative:
+// anything with text, images or browser chrome in it has luma variance far
+// above the threshold and counts as a real capture. Undecodable bytes count as
+// blank; there is nothing useful to store either way.
+func screenshotIsBlank(data []byte) bool {
+	if len(data) < screenshotMinBytes {
+		return true
+	}
+	img, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		gologger.Debug().Msgf("hybrid: could not decode viewport screenshot for the blank check: %v", err)
+		return true
+	}
+	b := img.Bounds()
+	if b.Dx() == 0 || b.Dy() == 0 {
+		return true
+	}
+
+	var n, sum, sumSq float64
+	for y := b.Min.Y; y < b.Max.Y; y += screenshotSampleStride {
+		for x := b.Min.X; x < b.Max.X; x += screenshotSampleStride {
+			r, g, bl, _ := img.At(x, y).RGBA()
+			// Rec. 601 luma, scaled back from the 16-bit values RGBA returns.
+			luma := (0.299*float64(r) + 0.587*float64(g) + 0.114*float64(bl)) / 257
+			n++
+			sum += luma
+			sumSq += luma * luma
+		}
+	}
+	if n == 0 {
+		return true
+	}
+	mean := sum / n
+	return sumSq/n-mean*mean < screenshotBlankVariance
 }
 
 // traverseDOMNode performs traversal of node completely building a pseudo-HTML
